@@ -31,6 +31,10 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Literal
 
+# FIXME: drop defusedxml + Atom parsing once the producer (gha-rxiv-feed-action)
+# emits a normalized arxiv CSV that already carries the abstract. See
+# docs/design.md "Servers and schema adapters".
+import defusedxml.ElementTree as ET
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -51,6 +55,8 @@ DEFAULT_EXTRACTION_PROMPT = (
 )
 
 RXIV_DETAILS_URL = "https://api.biorxiv.org/details/{server}/{doi}"
+ARXIV_QUERY_URL = "https://export.arxiv.org/api/query?id_list={arxiv_id}"
+ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 GITHUB_MODELS_URL = "https://models.github.ai/inference/chat/completions"
 RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 
@@ -81,6 +87,35 @@ class Paper(BaseModel):
     authors: str = Field(alias="Authors")
 
 
+class ArxivCsvRow(BaseModel):
+    """Raw row of the arxiv producer CSV (`data/arxiv/<year>/<week>.csv`).
+
+    Schema differs from the biorxiv/medrxiv `Paper`: arxiv id replaces DOI,
+    no Category or Authors columns, and the title is single-quoted.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    published: str = Field(alias="Published")
+    weekday: str = Field(alias="Weekday(Monday==0)")
+    updated: str = Field(alias="Updated")
+    arxiv_id: str = Field(alias="ID")
+    version: str = Field(alias="Version")
+    title: str = Field(alias="Title")
+
+    def to_paper(self) -> "Paper":
+        date_str = self.published[:10]
+        iso_week = dt.date.fromisoformat(date_str).isocalendar().week
+        return Paper(
+            date=date_str,
+            iso_week=f"{iso_week:02d}",
+            doi=self.arxiv_id,
+            version=self.version,
+            category="",
+            title=self.title.strip().strip("'").strip(),
+            authors="",
+        )
+
+
 class Verdict(BaseModel):
     """Per-paper relevance result; also the DOI-cache payload schema."""
 
@@ -104,7 +139,7 @@ class ExtractedFields(BaseModel):
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--feed-repo", required=True)
-    p.add_argument("--server", choices=["biorxiv", "medrxiv"], default="biorxiv")
+    p.add_argument("--server", choices=["biorxiv", "medrxiv", "arxiv"], default="biorxiv")
     p.add_argument("--year", default="")
     p.add_argument("--week", default="")
     p.add_argument("--topic", required=True)
@@ -145,9 +180,17 @@ def fetch_feed(feed_repo: str, server: str, year: str, week: str, dest: Path) ->
     dest.write_text(proc.stdout)
 
 
-def load_papers(csv_path: Path) -> list[Paper]:
+def _paper_from_arxiv_row(row: dict) -> Paper:
+    """Validate an arxiv producer CSV row and adapt it to `Paper`."""
+    return ArxivCsvRow.model_validate(row).to_paper()
+
+
+def load_papers(csv_path: Path, server: str = "biorxiv") -> list[Paper]:
     with csv_path.open(newline="") as f:
-        return [Paper.model_validate(row) for row in csv.DictReader(f)]
+        rows = list(csv.DictReader(f))
+    if server == "arxiv":
+        return [_paper_from_arxiv_row(row) for row in rows]
+    return [Paper.model_validate(row) for row in rows]
 
 
 def write_papers(papers: list[Paper], dest: Path) -> None:
@@ -307,13 +350,38 @@ def is_relevant(
     return relevant
 
 
-def fetch_abstract(server: str, doi: str) -> str:
-    if Settings().offline:
+def _urlopen_bytes(url: str, timeout: int = 15) -> bytes:
+    """Read the body of an HTTPS GET. Single chokepoint for outbound HTTP so
+    Bandit B310 is suppressed exactly once and callers cannot pass non-https.
+    """
+    if not url.startswith("https://"):
+        raise ValueError(f"refusing non-https URL: {url!r}")
+    with urllib.request.urlopen(url, timeout=timeout) as resp:  # nosec B310
+        return resp.read()
+
+
+def _fetch_arxiv_abstract(arxiv_id: str) -> str:
+    url = ARXIV_QUERY_URL.format(arxiv_id=arxiv_id)
+    try:
+        data = _urlopen_bytes(url)
+    except urllib.error.URLError as exc:
+        print(f"WARN: abstract fetch failed for {arxiv_id}: {exc}", file=sys.stderr)
         return ""
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        print(f"WARN: abstract parse failed for {arxiv_id}: {exc}", file=sys.stderr)
+        return ""
+    summary = root.find("atom:entry/atom:summary", ATOM_NS)
+    if summary is None or summary.text is None:
+        return ""
+    return summary.text.strip()
+
+
+def _fetch_rxiv_abstract(server: str, doi: str) -> str:
     url = RXIV_DETAILS_URL.format(server=server, doi=doi)
     try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            payload = json.load(resp)
+        payload = json.loads(_urlopen_bytes(url))
     except (urllib.error.URLError, json.JSONDecodeError) as exc:
         print(f"WARN: abstract fetch failed for {doi}: {exc}", file=sys.stderr)
         return ""
@@ -321,6 +389,14 @@ def fetch_abstract(server: str, doi: str) -> str:
     if not collection:
         return ""
     return collection[0].get("abstract", "") or ""
+
+
+def fetch_abstract(server: str, doi: str) -> str:
+    if Settings().offline:
+        return ""
+    if server == "arxiv":
+        return _fetch_arxiv_abstract(doi)
+    return _fetch_rxiv_abstract(server, doi)
 
 
 def extract_fields(abstract: str, *, model: str, system_prompt: str) -> ExtractedFields:
@@ -435,11 +511,20 @@ def main() -> int:
     print(f"Fetching {args.feed_repo} -> data/{args.server}/{year}/{week}.csv", file=sys.stderr)
     fetch_feed(args.feed_repo, args.server, year, week, feed_csv)
 
-    papers = load_papers(feed_csv)
+    papers = load_papers(feed_csv, server=args.server)
     total = len(papers)
     print(f"Loaded {total} papers", file=sys.stderr)
 
-    papers = _prefilter(papers, args.categories, args.max_papers)
+    categories = args.categories
+    if args.server == "arxiv" and categories:
+        print(
+            "WARN: --categories ignored for --server=arxiv "
+            "(CSV has no Category column)",
+            file=sys.stderr,
+        )
+        categories = ""
+
+    papers = _prefilter(papers, categories, args.max_papers)
     after_prefilter = len(papers)
 
     relevance_prompt = (os.environ.get("RELEVANCE_PROMPT") or DEFAULT_RELEVANCE_PROMPT).format(

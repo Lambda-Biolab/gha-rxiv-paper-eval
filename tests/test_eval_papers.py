@@ -589,5 +589,166 @@ class OfflineEndToEndTests(unittest.TestCase):
             self.assertIn("DOI", lines[0])
 
 
+# ---------------------------------------------------------------------------
+# FetchAbstractArxivTests
+# ---------------------------------------------------------------------------
+
+
+class FetchAbstractArxivTests(unittest.TestCase):
+    _ATOM_PAYLOAD = (
+        b'<?xml version="1.0" encoding="UTF-8"?>'
+        b'<feed xmlns="http://www.w3.org/2005/Atom">'
+        b'<entry>'
+        b'<id>http://arxiv.org/abs/2406.09418v1</id>'
+        b'<title>Some title</title>'
+        b'<summary>This is the abstract text.</summary>'
+        b'</entry>'
+        b'</feed>'
+    )
+
+    def setUp(self) -> None:
+        self._env = patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("RXIV_EVAL_OFFLINE", None)
+        self.addCleanup(self._env.stop)
+
+    def test_returns_summary_text_from_atom(self) -> None:
+        resp = io.BytesIO(self._ATOM_PAYLOAD)
+        with patch("urllib.request.urlopen", return_value=resp) as mock_open:
+            result = eval_papers.fetch_abstract(server="arxiv", doi="2406.09418")
+        self.assertEqual(result, "This is the abstract text.")
+        called_with = mock_open.call_args.args[0]
+        url_str = called_with.full_url if hasattr(called_with, "full_url") else str(called_with)
+        self.assertIn("export.arxiv.org", url_str)
+        self.assertIn("2406.09418", url_str)
+
+    def test_returns_empty_on_offline(self) -> None:
+        with patch.dict(os.environ, {"RXIV_EVAL_OFFLINE": "1"}):
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=AssertionError("urlopen must not fire in offline mode"),
+            ):
+                result = eval_papers.fetch_abstract(server="arxiv", doi="2406.09418")
+        self.assertEqual(result, "")
+
+    def test_parse_error_returns_empty_string(self) -> None:
+        resp = io.BytesIO(b"not xml at all")
+        with patch("urllib.request.urlopen", return_value=resp):
+            result = eval_papers.fetch_abstract(server="arxiv", doi="2406.09418")
+        self.assertEqual(result, "")
+
+    def test_url_error_returns_empty_string(self) -> None:
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("transient"),
+        ):
+            result = eval_papers.fetch_abstract(server="arxiv", doi="2406.09418")
+        self.assertEqual(result, "")
+
+
+# ---------------------------------------------------------------------------
+# LoadPapersServerDispatchTests
+# ---------------------------------------------------------------------------
+
+_FIXTURE_ARXIV_PATH = pathlib.Path(__file__).parent / "fixtures" / "feed-arxiv-min.csv"
+
+
+class LoadPapersServerDispatchTests(unittest.TestCase):
+    def test_biorxiv_path_unchanged(self) -> None:
+        papers = eval_papers.load_papers(_FIXTURE_PATH, server="biorxiv")
+        # feed-min.csv has 10 rows
+        self.assertEqual(len(papers), 10)
+        self.assertTrue(all(p.doi.startswith(("10.1101/", "10.64898/")) for p in papers))
+
+    def test_arxiv_path_uses_arxiv_adapter(self) -> None:
+        papers = eval_papers.load_papers(_FIXTURE_ARXIV_PATH, server="arxiv")
+        self.assertEqual(len(papers), 3)
+        # arxiv IDs survive as the doi field
+        self.assertEqual(papers[0].doi, "2406.09418")
+        self.assertEqual(papers[0].iso_week, "24")
+        # title is unquoted
+        self.assertFalse(papers[0].title.startswith("'"))
+
+
+# ---------------------------------------------------------------------------
+# CategoriesWarningWithArxivTests
+# ---------------------------------------------------------------------------
+
+
+class CategoriesWarningWithArxivTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._env = patch.dict(
+            os.environ,
+            {
+                "GH_TOKEN": "fake-token",
+                "RXIV_EVAL_OFFLINE": "1",
+                "RXIV_EVAL_STUB_MODE": "hash",
+                "RXIV_EVAL_RETRY_BASE_SECS": "0.01",
+            },
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def test_main_warns_and_ignores_categories_for_arxiv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = pathlib.Path(tmpdir)
+
+            def fake_fetch_feed(feed_repo, server, year, week, dest):
+                shutil.copy(_FIXTURE_ARXIV_PATH, dest)
+
+            saved_argv = sys.argv[:]
+            try:
+                sys.argv = [
+                    "eval_papers.py",
+                    "--feed-repo", "any/repo",
+                    "--server", "arxiv",
+                    "--topic", "test",
+                    "--categories", "cs.LG",  # arxiv CSV has no Category column
+                    "--max-papers", "5",
+                    "--output-dir", str(out),
+                ]
+                with patch.object(eval_papers, "fetch_feed", side_effect=fake_fetch_feed):
+                    stderr_capture = io.StringIO()
+                    with patch("sys.stderr", stderr_capture):
+                        rc = eval_papers.main()
+            finally:
+                sys.argv = saved_argv
+
+            self.assertEqual(rc, 0)
+            stderr_output = stderr_capture.getvalue()
+            self.assertIn("--categories", stderr_output)
+            self.assertIn("arxiv", stderr_output)
+            # The 3 arxiv fixture rows must reach the relevance pass — none
+            # should be dropped by a phantom category prefilter.
+            self.assertIn("Loaded 3 papers", stderr_output)
+
+    def test_main_does_not_warn_when_no_categories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = pathlib.Path(tmpdir)
+
+            def fake_fetch_feed(feed_repo, server, year, week, dest):
+                shutil.copy(_FIXTURE_ARXIV_PATH, dest)
+
+            saved_argv = sys.argv[:]
+            try:
+                sys.argv = [
+                    "eval_papers.py",
+                    "--feed-repo", "any/repo",
+                    "--server", "arxiv",
+                    "--topic", "test",
+                    "--max-papers", "5",
+                    "--output-dir", str(out),
+                ]
+                with patch.object(eval_papers, "fetch_feed", side_effect=fake_fetch_feed):
+                    stderr_capture = io.StringIO()
+                    with patch("sys.stderr", stderr_capture):
+                        rc = eval_papers.main()
+            finally:
+                sys.argv = saved_argv
+
+            self.assertEqual(rc, 0)
+            self.assertNotIn("--categories", stderr_capture.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
