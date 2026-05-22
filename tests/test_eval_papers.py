@@ -72,6 +72,30 @@ class GhModelsRestTests(unittest.TestCase):
             ],
         )
 
+    def test_models_url_override_via_env(self) -> None:
+        resp = _fake_response(
+            {"choices": [{"message": {"role": "assistant", "content": "YES"}}]}
+        )
+        custom = "https://api.openai.example/v1/chat/completions"
+        with (
+            patch.dict(os.environ, {"RXIV_EVAL_MODELS_URL": custom}),
+            patch("urllib.request.urlopen", return_value=resp) as mock_urlopen,
+        ):
+            eval_papers.gh_models_rest(
+                model="gpt-4o", system_prompt="s", user_prompt="u", max_tokens=4
+            )
+        self.assertEqual(mock_urlopen.call_args.args[0].full_url, custom)
+
+    def test_models_url_refuses_non_https(self) -> None:
+        with (
+            patch.dict(os.environ, {"RXIV_EVAL_MODELS_URL": "http://insecure.example/v1"}),
+            self.assertRaises(ValueError) as ctx,
+        ):
+            eval_papers.gh_models_rest(
+                model="m", system_prompt="s", user_prompt="u", max_tokens=4
+            )
+        self.assertIn("non-https", str(ctx.exception))
+
     def test_http_error_raises_runtime_error(self) -> None:
         http_err = urllib.error.HTTPError(
             url=eval_papers.GITHUB_MODELS_URL,
@@ -804,6 +828,38 @@ class DefaultTopicTests(unittest.TestCase):
         finally:
             sys.argv = saved_argv
         self.assertEqual(args.topic, eval_papers.DEFAULT_TOPIC)
+
+
+# ---------------------------------------------------------------------------
+# PaperUrlTests
+# ---------------------------------------------------------------------------
+
+
+class PaperUrlTests(unittest.TestCase):
+    def test_arxiv_uses_arxiv_abs_url(self) -> None:
+        self.assertEqual(
+            eval_papers._paper_url("arxiv", "2406.09418"),
+            "https://arxiv.org/abs/2406.09418",
+        )
+
+    def test_biorxiv_uses_doi_resolver(self) -> None:
+        self.assertEqual(
+            eval_papers._paper_url("biorxiv", "10.1101/2024.09.07.000001"),
+            "https://doi.org/10.1101/2024.09.07.000001",
+        )
+
+    def test_medrxiv_uses_doi_resolver(self) -> None:
+        self.assertEqual(
+            eval_papers._paper_url("medrxiv", "10.1101/2024.09.07.000002"),
+            "https://doi.org/10.1101/2024.09.07.000002",
+        )
+
+    def test_unknown_server_falls_back_to_doi(self) -> None:
+        # Defensive: any future server defaults to the doi.org resolver.
+        self.assertEqual(
+            eval_papers._paper_url("chemrxiv", "10.26434/x"),
+            "https://doi.org/10.26434/x",
+        )
 
 
 if __name__ == "__main__":

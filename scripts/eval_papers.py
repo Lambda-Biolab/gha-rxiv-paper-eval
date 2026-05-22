@@ -95,6 +95,20 @@ ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 GITHUB_MODELS_URL = "https://models.github.ai/inference/chat/completions"
 RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 
+# arxiv ids are not DOIs; doi.org won't resolve them. Bio servers use real
+# DOIs registered with CrossRef so doi.org is the canonical resolver.
+_PAPER_URL_TEMPLATES: dict[str, str] = {
+    "arxiv": "https://arxiv.org/abs/{id}",
+    "biorxiv": "https://doi.org/{id}",
+    "medrxiv": "https://doi.org/{id}",
+}
+
+
+def _paper_url(server: str, paper_id: str) -> str:
+    """Return the canonical web URL for a paper given its server and id."""
+    template = _PAPER_URL_TEMPLATES.get(server, "https://doi.org/{id}")
+    return template.format(id=paper_id)
+
 
 class Settings(BaseSettings):
     """Process-wide knobs sourced from RXIV_EVAL_* env vars."""
@@ -108,6 +122,11 @@ class Settings(BaseSettings):
     # arxiv asks for ~3s between requests; back-to-back fetches otherwise
     # quickly trip HTTP 429. Set to 0 in tests / when running offline.
     arxiv_request_delay_secs: float = 3.0
+    # OpenAI-compatible chat-completions endpoint. Defaults to GitHub Models;
+    # override via RXIV_EVAL_MODELS_URL to point at Azure OpenAI, a local
+    # vLLM/Ollama, an OpenAI-compatible proxy, etc. Caller still supplies the
+    # bearer token via GH_TOKEN.
+    models_url: str = GITHUB_MODELS_URL
 
 
 class Paper(BaseModel):
@@ -335,6 +354,9 @@ def _with_retry(call: Callable[[], T], settings: Settings) -> T:
 
 
 def _github_models_call(model: str, system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+    url = Settings().models_url
+    if not url.startswith("https://"):
+        raise ValueError(f"refusing non-https models URL: {url!r}")
     payload = {
         "model": model,
         "temperature": 0,
@@ -344,9 +366,10 @@ def _github_models_call(model: str, system_prompt: str, user_prompt: str, max_to
             {"role": "user", "content": user_prompt},
         ],
     }
-    # S310: GITHUB_MODELS_URL is a constant https:// endpoint.
+    # S310: scheme is enforced above; URL is operator-supplied via
+    # RXIV_EVAL_MODELS_URL (defaults to GitHub Models).
     req = urllib.request.Request(  # noqa: S310
-        GITHUB_MODELS_URL,
+        url,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
@@ -502,7 +525,7 @@ def write_summary(
         "",
     ]
     for p in relevant:
-        lines.append(f"- [{p.title}](https://doi.org/{p.doi}) — *{p.category}*")
+        lines.append(f"- [{p.title}]({_paper_url(server, p.doi)}) — *{p.category}*")
     (output_dir / "summary.md").write_text("\n".join(lines) + "\n")
 
 
