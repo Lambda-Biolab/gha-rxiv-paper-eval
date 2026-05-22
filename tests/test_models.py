@@ -142,34 +142,15 @@ def test_verdict_basic_construction() -> None:
 
 
 def test_verdict_serializes_to_dict() -> None:
-    v = Verdict(doi="10.1101/x", relevant=False, raw="NO", reason="off-topic")
+    v = Verdict(doi="10.1101/x", relevant=False, raw="NO")
     payload = v.model_dump()
-    assert payload == {
-        "doi": "10.1101/x",
-        "relevant": False,
-        "raw": "NO",
-        "reason": "off-topic",
-    }
+    assert payload == {"doi": "10.1101/x", "relevant": False, "raw": "NO"}
 
 
 def test_verdict_roundtrip_through_json() -> None:
-    v = Verdict(doi="10.1101/x", relevant=True, raw="YES", reason="matches topic")
+    v = Verdict(doi="10.1101/x", relevant=True, raw="YES")
     rehydrated = Verdict.model_validate_json(v.model_dump_json())
     assert rehydrated == v
-
-
-def test_verdict_reason_defaults_empty() -> None:
-    # `reason` is optional so unparseable / pre-format model output stays usable.
-    v = Verdict(doi="10.1101/x", relevant=True, raw="YES")
-    assert v.reason == ""
-
-
-def test_verdict_loads_legacy_json_without_reason() -> None:
-    # Cache files written before the `reason` field existed must still load.
-    legacy = '{"doi":"10.1101/x","relevant":true,"raw":"YES"}'
-    v = Verdict.model_validate_json(legacy)
-    assert v.reason == ""
-    assert v.relevant is True
 
 
 # ---------------------------------------------------------------------------
@@ -180,27 +161,29 @@ def test_verdict_loads_legacy_json_without_reason() -> None:
 def test_extracted_fields_defaults() -> None:
     ef = ExtractedFields()
     assert ef.summary == ""
-    assert ef.organisms == []
+    assert ef.subjects == []
     assert ef.methods == []
     assert ef.key_findings == []
-    assert ef.study_type == "other"
+    assert ef.study_type == ""
 
 
 def test_extracted_fields_parses_valid_json() -> None:
     raw = (
-        '{"summary": "Discovered X.", "organisms": ["E. coli"], '
+        '{"summary": "Discovered X.", "subjects": ["E. coli"], '
         '"methods": ["MD"], "key_findings": ["binds Y"], "study_type": "in_silico"}'
     )
     ef = ExtractedFields.model_validate_json(raw)
     assert ef.summary == "Discovered X."
-    assert ef.organisms == ["E. coli"]
+    assert ef.subjects == ["E. coli"]
     assert ef.study_type == "in_silico"
 
 
-def test_extracted_fields_rejects_unknown_study_type() -> None:
-    bad = '{"study_type": "speculative"}'
-    with pytest.raises(ValidationError):
-        ExtractedFields.model_validate_json(bad)
+def test_extracted_fields_accepts_any_study_type_string() -> None:
+    # study_type is plain str so it works across servers (bio in_silico,
+    # arxiv theoretical, medrxiv clinical_trial, etc.).
+    raw = '{"study_type": "speculative"}'
+    ef = ExtractedFields.model_validate_json(raw)
+    assert ef.study_type == "speculative"
 
 
 def test_extracted_fields_allows_extra_keys() -> None:
